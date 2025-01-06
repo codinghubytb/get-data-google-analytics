@@ -3,62 +3,74 @@ from datetime import datetime, timedelta
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import DateRange, Dimension, Metric, RunReportRequest
 from google.oauth2 import service_account
-from collections import defaultdict
 from pymongo import MongoClient
+from collections import defaultdict
 
 # Configuration MongoDB
 MONGO_URI = "mongodb://localhost:27017/"
 DB_NAME = ""
-COLLECTION_NAME = "" 
+COLLECTION_NAME = ""
+SERVICE_ACCOUNT_FILE = ".json"
 
 def sample_run_report(property_id, source_name):
-    SERVICE_ACCOUNT_FILE = ".json"
-    # Charger les credentials directement à partir du fichier de compte de service
-    credentials = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE
-    )
-
-    # Initialiser le client avec les credentials
+    credentials = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE)
     client = BetaAnalyticsDataClient(credentials=credentials)
 
-    request = RunReportRequest(
-        property=f"properties/{property_id}",
-        dimensions=[Dimension(name="date")],  # Ajouter la dimension "date"
-        metrics=[Metric(name="activeUsers")],
-        date_ranges=[DateRange(start_date="2024-01-01", end_date="today")],  # Définir la période de temps depuis janvier
-    )
-    response = client.run_report(request)
-    
-    # Pré-remplir le dictionnaire des résultats mensuels avec tous les mois de l'année
-    monthly_results = defaultdict(int, {datetime(2024, month, 1).strftime('%b'): 0 for month in range(1, 13)})
-    for row in response.rows:
-        date_str = row.dimension_values[0].value
-        date_obj = datetime.strptime(date_str, '%Y%m%d')
-        month_str = date_obj.strftime('%b')  # Utiliser les abréviations des noms de mois (par exemple, "Oct" pour octobre)
-        monthly_results[month_str] += int(row.metric_values[0].value)
+    # Génération des mois de janvier 2024 à janvier 2025
+    start_date = datetime.strptime("2024-01-01", "%Y-%m-%d")
+    end_date = current_date = datetime.now()
 
+    monthly_results = {}
+    temp_date = start_date
 
-    date_30_days_ago = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+    while temp_date <= end_date:
+        month_start = temp_date
+        month_end = (temp_date + timedelta(days=32)).replace(day=1) - timedelta(days=1)  # Dernier jour du mois
+        if month_end > end_date:
+            month_end = end_date
+
+        # Requête pour le mois courant
+        request = RunReportRequest(
+            property=f"properties/{property_id}",
+            dimensions=[Dimension(name="date")],
+            metrics=[Metric(name="activeUsers")],
+            date_ranges=[DateRange(
+                start_date=month_start.strftime("%Y-%m-%d"),
+                end_date=month_end.strftime("%Y-%m-%d")
+            )],
+        )
+        response = client.run_report(request)
+
+        # Calcul du total pour le mois
+        total_users = sum(int(row.metric_values[0].value) for row in response.rows)
+        month_label = month_start.strftime('%b %Y')  # Format "Jan 2024"
+        monthly_results[month_label] = total_users
+
+        temp_date = (temp_date + timedelta(days=32)).replace(day=1)  # Passer au mois suivant
+
+    # Calcul des 30 derniers jours
+    current_date = datetime.now()
+    date_30_days_ago = (current_date - timedelta(days=30)).strftime('%Y-%m-%d')
     request2 = RunReportRequest(
         property=f"properties/{property_id}",
-        dimensions=[Dimension(name="date")],  # Ajouter la dimension "date"
+        dimensions=[Dimension(name="date")],
         metrics=[Metric(name="activeUsers")],
-        date_ranges=[DateRange(start_date=date_30_days_ago, end_date="today")],  # 30 derniers jours
+        date_ranges=[DateRange(
+            start_date=date_30_days_ago,
+            end_date=current_date.strftime("%Y-%m-%d")
+        )],
     )
     response2 = client.run_report(request2)
-    
-    nb_user_30_days = sum(
-        int(row.metric_values[0].value) for row in response2.rows
-    )
-    # Créer le document à insérer dans MongoDB
+    nb_user_30_days = sum(int(row.metric_values[0].value) for row in response2.rows)
+
+    # Préparer le document MongoDB
     document = {
         "propertyId": property_id,
         "source": source_name,
-        "data": [{"month": month, "activeUsers": active_users} for month, active_users in sorted(monthly_results.items(), key=lambda x: datetime.strptime(x[0], '%b'))],
-        "nbUser30Day":nb_user_30_days
+        "data": [{"month": month, "activeUsers": monthly_results[month]} for month in monthly_results],
+        "nbUser30Day": nb_user_30_days
     }
 
-    # Insérer les données dans MongoDB
     insert_into_mongodb(document)
 
 def insert_into_mongodb(document):
